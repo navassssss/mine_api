@@ -289,6 +289,18 @@ app.post('/api/chat', async (req, res) => {
         else if (chunk.chat && chunk.chat.id) serverChatId = chunk.chat.id;
         else if (chunk.message && chunk.message.chatId) serverChatId = chunk.message.chatId;
 
+        // Check for structured stream errors yielded from parseConnectStream
+        if (chunk.__streamError) {
+          console.error('[Stream Error] Kimi API returned an error:', chunk.message);
+          if (isSSE) {
+            res.write(`data: ${JSON.stringify({ error: chunk.message })}\n\n`);
+          } else {
+            res.write(`\nError: ${chunk.message}`);
+          }
+          res.end();
+          return;
+        }
+
         // Capture assistant message ID
         if (chunk.message && chunk.message.role === 'assistant' && chunk.message.id) {
           lastMsgId = chunk.message.id;
