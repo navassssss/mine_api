@@ -258,7 +258,7 @@
         return;
       }
 
-      terminal.textContent = '> Establishing stream connection...\n';
+      terminal.textContent = '> Establishing SSE stream connection...\n';
       
       const modelVal = modelSelect.value;
       const messageVal = messageInput.value;
@@ -269,15 +269,14 @@
         model: modelVal,
         stream: true
       };
-      if (instVal) {
-        payload.instructions = instVal;
-      }
+      if (instVal) payload.instructions = instVal;
 
       try {
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            'Accept': 'text/event-stream',   // ← request SSE format
             'x-api-key': apiKeyVal
           },
           body: JSON.stringify(payload)
@@ -290,7 +289,9 @@
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder('utf-8');
-        terminal.textContent += '> Stream opened. Receiving chunks...\n\n';
+        terminal.textContent += '> Stream opened. Receiving tokens...\n\n';
+
+        let buffer = '';
 
         while (true) {
           const { done, value } = await reader.read();
@@ -298,9 +299,38 @@
             terminal.textContent += '\n\n> [Stream Finished]';
             break;
           }
-          const chunk = decoder.decode(value, { stream: true });
-          terminal.textContent += chunk;
-          terminal.scrollTop = terminal.scrollHeight; // Autoscroll
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process all complete SSE lines in the buffer
+          const lines = buffer.split('\n');
+          // Keep the last incomplete line in the buffer
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith('data:')) continue;
+
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === '[DONE]') {
+              terminal.textContent += '\n\n> [Stream Finished]';
+              return;
+            }
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed.error) {
+                terminal.textContent += `\n❌ Server Error: ${parsed.error}`;
+                return;
+              }
+              if (parsed.delta) {
+                terminal.textContent += parsed.delta;
+                terminal.scrollTop = terminal.scrollHeight;
+              }
+            } catch {
+              // Non-JSON data line, ignore
+            }
+          }
         }
 
       } catch (err) {
