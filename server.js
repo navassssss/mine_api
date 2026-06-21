@@ -47,8 +47,8 @@ const apiLimiter = rateLimit({
 // Apply rate limiter to API endpoints
 app.use('/api/', apiLimiter);
 
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true, limit: '2mb' }));
+app.use(bodyParser.json({ limit: '2mb' }));
 
 // --- Developer Authentication Portal & Dashboard Routes ---
 const authPublicDir = path.resolve(__dirname, 'supabase_auth/public');

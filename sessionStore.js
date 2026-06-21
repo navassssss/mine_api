@@ -14,6 +14,10 @@ let refreshPromise = null;
 let lastRefreshTime = 0;
 const COOLDOWN_PERIOD = 300000; // 5-minute cooling off period on failure
 
+let sessionCache = null;
+let sessionCacheTime = 0;
+const SESSION_CACHE_TTL = 5000; // 5 seconds cache TTL
+
 let localRefreshHandler = null;
 
 export const sessionStore = {
@@ -28,9 +32,16 @@ export const sessionStore = {
    * Reads session credentials from session.json, falling back to configuration environment values.
    */
   readSession() {
+    // Return cached session if it's fresh enough (prevents synchronous disk I/O bottleneck)
+    if (sessionCache && (Date.now() - sessionCacheTime < SESSION_CACHE_TTL)) {
+      return sessionCache;
+    }
+
     try {
       if (fs.existsSync(sessionPath)) {
-        return JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+        sessionCache = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+        sessionCacheTime = Date.now();
+        return sessionCache;
       }
     } catch (e) {
       console.error("[SessionStore] Error reading session.json:", e.message);
@@ -51,6 +62,8 @@ export const sessionStore = {
 
     try {
       fs.writeFileSync(sessionPath, JSON.stringify(defaults, null, 2), 'utf8');
+      sessionCache = defaults;
+      sessionCacheTime = Date.now();
       console.log("[SessionStore] Initialized session.json seed file.");
     } catch (err) {
       console.error("[SessionStore] Error writing initial session.json:", err.message);
@@ -73,6 +86,8 @@ export const sessionStore = {
 
     try {
       fs.writeFileSync(sessionPath, JSON.stringify(current, null, 2), 'utf8');
+      sessionCache = current;
+      sessionCacheTime = Date.now();
       console.log("[SessionStore] session.json updated successfully.");
     } catch (e) {
       console.error("[SessionStore] Error writing session.json:", e.message);
