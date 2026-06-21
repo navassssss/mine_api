@@ -114,6 +114,13 @@ let cachedParentId = null;
 
 // Asynchronously pre-fetch chat history parent ID at server start
 async function initializeParentIdCache() {
+  // In production, skip eager cache init to avoid triggering a session refresh + Puppeteer OOM.
+  // The cache will be lazily populated on the first actual /api/chat request.
+  if (process.env.NODE_ENV === 'production') {
+    console.log('[Cache Init] Skipping eager cache fetch in production (lazy mode). Cache will populate on first request.');
+    return;
+  }
+
   try {
     console.log(`[Cache Init] Pre-fetching latest parent_id for chat: ${config.LIVE_API_CHAT_ID}`);
     const msgRes = await api.listMessages(config.LIVE_API_CHAT_ID, 50);
