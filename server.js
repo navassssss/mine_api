@@ -20,6 +20,9 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
+// Trust Render's reverse proxy for accurate IP identification (fixes express-rate-limit error)
+app.set('trust proxy', 1);
+
 // Security Middlewares
 app.use(helmet({
   contentSecurityPolicy: false // Allow inline scripts/styles for the portal UI
