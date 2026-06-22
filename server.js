@@ -388,6 +388,219 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// --- OpenAI Compatible API Layer ---
+app.get('/v1/models', (req, res) => {
+  res.json({
+    object: "list",
+    data: [
+      { id: "k2d6", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "aicore" },
+      { id: "k2d6-thinking", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "aicore" },
+      { id: "k2d6-agent", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "aicore" },
+      { id: "k2d6-agent-ultra", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "aicore" }
+    ]
+  });
+});
+
+app.post('/v1/chat/completions', async (req, res) => {
+  // Extract API Key
+  let apiKey = req.headers['x-api-key'] || req.query.key;
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    apiKey = authHeader.substring(7);
+  }
+
+  if (!apiKey) {
+    return res.status(401).json({ error: { message: 'Authentication required. Provide a valid API key.', type: 'invalid_request_error', param: null, code: 'unauthorized' } });
+  }
+
+  const quotaCheck = await db.consumeRequest(apiKey);
+  if (!quotaCheck.valid) {
+    return res.status(401).json({ error: { message: 'Invalid API key.', type: 'invalid_request_error', param: null, code: 'invalid_api_key' } });
+  }
+
+  if (quotaCheck.quotaExhausted) {
+    return res.status(403).json({ error: { message: 'API key request quota exhausted.', type: 'invalid_request_error', param: null, code: 'quota_exceeded' } });
+  }
+
+  const { model, messages, stream, tools, response_format } = req.body;
+  
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: { message: 'Missing or invalid "messages" parameter.', type: 'invalid_request_error', param: 'messages', code: 'invalid_type' } });
+  }
+
+  let systemPrompt = '';
+  let userMessage = '';
+  let fullConversationContext = '';
+
+  // Handle Response Format (JSON mode)
+  if (response_format && response_format.type === 'json_object') {
+    systemPrompt += `You must format your entire response as a valid JSON object. Do not include any markdown formatting blocks like \`\`\`json. Output ONLY raw JSON.\n\n`;
+  } else if (response_format && response_format.type === 'json_schema' && response_format.json_schema) {
+    systemPrompt += `You must format your entire response as valid JSON matching the following schema. Output ONLY raw JSON, no markdown.\nSchema:\n${JSON.stringify(response_format.json_schema, null, 2)}\n\n`;
+  }
+
+  // 1. Tool Calling Injection
+  if (tools && Array.isArray(tools) && tools.length > 0) {
+    systemPrompt += `You are an AI assistant with access to tools. If you need to call a tool, you MUST output exactly and ONLY a JSON object matching this schema: { "tool_calls": [ { "id": "call_abc123", "type": "function", "function": { "name": "the_tool_name", "arguments": "{\\"arg_name\\":\\"arg_value\\"}" } } ] }. Do not include any other text if you are calling a tool.\n\nAvailable tools:\n${JSON.stringify(tools, null, 2)}\n\n`;
+  }
+
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      systemPrompt += msg.content + '\n';
+    } else if (msg.role === 'user') {
+      userMessage = msg.content;
+      fullConversationContext += `User: ${msg.content}\n`;
+    } else if (msg.role === 'assistant') {
+      fullConversationContext += `Assistant: ${msg.content}\n`;
+    } else if (msg.role === 'tool') {
+      fullConversationContext += `Tool Response (${msg.name}): ${msg.content}\n`;
+    }
+  }
+
+  // If there's history, we can pass it as one big text block to the gateway
+  // Otherwise just pass the user message.
+  let finalMessageText = userMessage || "Continue.";
+  if (fullConversationContext && messages.length > 2) {
+      finalMessageText = "Conversation History:\n" + fullConversationContext + "\nPlease respond to the last User message.";
+  }
+
+  if (systemPrompt.trim()) {
+    const yamlLines = `instructions: ${systemPrompt.trim().replace(/\n/g, ' ')} #exact-pattern`;
+    finalMessageText = `---\n${yamlLines}\n---\n${finalMessageText}`;
+  }
+
+  const activeChatId = config.LIVE_API_CHAT_ID;
+  let activeParentId = cachedParentId;
+
+  try {
+    if (!activeParentId) {
+      try {
+        const msgRes = await api.listMessages(activeChatId, 100);
+        const apiMessages = msgRes.messages || [];
+        if (apiMessages.length > 0) {
+          activeParentId = apiMessages[apiMessages.length - 1].id;
+          cachedParentId = activeParentId;
+        }
+      } catch (e) {}
+    }
+
+    const responseStream = await api.sendChatMessage(finalMessageText, activeChatId, activeParentId, model);
+    const cmplId = 'chatcmpl-' + Math.random().toString(36).substring(2, 15);
+    const created = Math.floor(Date.now() / 1000);
+    
+    // 3. Usage Tokens Estimation
+    const promptTokens = Math.max(1, Math.floor(finalMessageText.length / 4));
+    let completionTokens = 0;
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+
+      let lastMsgId = activeParentId;
+
+      for await (const chunk of api.parseConnectStream(responseStream)) {
+        if (chunk.__streamError) {
+          res.write(`data: ${JSON.stringify({ error: { message: chunk.message } })}\n\n`);
+          res.end();
+          return;
+        }
+
+        if (chunk.message && chunk.message.role === 'assistant' && chunk.message.id) {
+          lastMsgId = chunk.message.id;
+        }
+
+        if (chunk.block && chunk.block.text && chunk.block.text.content) {
+          const delta = chunk.block.text.content;
+          completionTokens += Math.max(1, Math.floor(delta.length / 4));
+          res.write(`data: ${JSON.stringify({
+            id: cmplId,
+            object: "chat.completion.chunk",
+            created: created,
+            model: model || "k2d6",
+            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+          })}\n\n`);
+        }
+      }
+
+      res.write(`data: ${JSON.stringify({
+        id: cmplId,
+        object: "chat.completion.chunk",
+        created: created,
+        model: model || "k2d6",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+
+      if (lastMsgId) cachedParentId = lastMsgId;
+
+    } else {
+      let fullResponseText = '';
+      let lastMsgId = activeParentId;
+
+      for await (const chunk of api.parseConnectStream(responseStream)) {
+        if (chunk.message && chunk.message.role === 'assistant' && chunk.message.id) {
+          lastMsgId = chunk.message.id;
+        }
+        if (chunk.block && chunk.block.text && chunk.block.text.content) {
+          fullResponseText += chunk.block.text.content;
+        }
+      }
+
+      if (lastMsgId) cachedParentId = lastMsgId;
+      
+      completionTokens = Math.max(1, Math.floor(fullResponseText.length / 4));
+
+      // 2. Parse Tool Calls if output is JSON
+      let parsedToolCalls = null;
+      let finishReason = "stop";
+      let msgObj = { role: "assistant", content: fullResponseText };
+
+      if (tools && tools.length > 0) {
+        try {
+          const jsonMatch = fullResponseText.match(/\{[\s\S]*"tool_calls"[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+              parsedToolCalls = parsed.tool_calls;
+              finishReason = "tool_calls";
+              msgObj = { role: "assistant", content: null, tool_calls: parsedToolCalls };
+            }
+          }
+        } catch (e) {
+          // fallback to text if parsing fails
+        }
+      }
+
+      res.json({
+        id: cmplId,
+        object: "chat.completion",
+        created: created,
+        model: model || "k2d6",
+        choices: [{
+          index: 0,
+          message: msgObj,
+          finish_reason: finishReason
+        }],
+        usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+      });
+    }
+
+  } catch (error) {
+    console.error('OpenAI API Chat Error:', error);
+    const isAuthError = error.message.includes('403') || error.message.includes('401');
+    const status = isAuthError ? 401 : 500;
+    const msg = isAuthError ? 'Authentication keys expired.' : `Internal API Error: ${error.message}`;
+
+    res.status(status).json({
+      error: { message: msg, type: 'api_error', param: null, code: isAuthError ? 'unauthorized' : 'internal_error' }
+    });
+  }
+});
+
 // Start the server
 const PORT = config.PORT;
 app.listen(PORT, () => {
