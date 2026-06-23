@@ -47,8 +47,8 @@ const apiLimiter = rateLimit({
 // Apply rate limiter to API endpoints
 app.use('/api/', apiLimiter);
 
-app.use(bodyParser.urlencoded({ extended: true, limit: '2mb' }));
-app.use(bodyParser.json({ limit: '2mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+app.use(bodyParser.json({ limit: '50mb' }));
 
 // --- Developer Authentication Portal & Dashboard Routes ---
 const authPublicDir = path.resolve(__dirname, 'supabase_auth/public');
@@ -402,6 +402,11 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  console.log("\n[DEBUG] --- INCOMING /v1/chat/completions REQUEST ---");
+  console.log("[DEBUG] HEADERS:", JSON.stringify(req.headers, null, 2));
+  console.log("[DEBUG] BODY:", JSON.stringify(req.body, null, 2));
+  console.log("[DEBUG] ---------------------------------------------");
+
   // Extract API Key
   let apiKey = req.headers['x-api-key'] || req.query.key;
   const authHeader = req.headers['authorization'];
@@ -444,16 +449,46 @@ app.post('/v1/chat/completions', async (req, res) => {
     systemPrompt += `You are an AI assistant with access to tools. If you need to call a tool, you MUST output exactly and ONLY a JSON object matching this schema: { "tool_calls": [ { "id": "call_abc123", "type": "function", "function": { "name": "the_tool_name", "arguments": "{\\"arg_name\\":\\"arg_value\\"}" } } ] }. Do not include any other text if you are calling a tool.\n\nAvailable tools:\n${JSON.stringify(tools, null, 2)}\n\n`;
   }
 
+  let fileIdsToAttach = [];
+
   for (const msg of messages) {
+    let textContent = '';
+    
+    // Handle advanced content blocks (e.g. from LangChain/Browser-Use)
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'text' && block.text) {
+          textContent += block.text + '\n';
+        } else if (block.type === 'image_url') {
+          if (block.image_url && block.image_url.url) {
+            try {
+              console.log("[DEBUG] Intercepted image_url block. Attempting to upload to Kimi CDN...");
+              const fileId = await api.uploadImage(block.image_url.url);
+              fileIdsToAttach.push(fileId);
+              textContent += '[Image Uploaded Successfully]\n';
+              console.log("[DEBUG] Image successfully uploaded with ID:", fileId);
+            } catch (err) {
+              console.error("[DEBUG] Image upload failed:", err.message);
+              textContent += '[Image Upload Failed]\n';
+            }
+          } else {
+            textContent += '[Image Provided]\n';
+          }
+        }
+      }
+    } else if (typeof msg.content === 'string') {
+      textContent = msg.content;
+    }
+
     if (msg.role === 'system') {
-      systemPrompt += msg.content + '\n';
+      systemPrompt += textContent + '\n';
     } else if (msg.role === 'user') {
-      userMessage = msg.content;
-      fullConversationContext += `User: ${msg.content}\n`;
+      userMessage = textContent;
+      fullConversationContext += `User: ${textContent}\n`;
     } else if (msg.role === 'assistant') {
-      fullConversationContext += `Assistant: ${msg.content}\n`;
+      fullConversationContext += `Assistant: ${textContent}\n`;
     } else if (msg.role === 'tool') {
-      fullConversationContext += `Tool Response (${msg.name}): ${msg.content}\n`;
+      fullConversationContext += `Tool Response (${msg.name}): ${textContent}\n`;
     }
   }
 
@@ -484,7 +519,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       } catch (e) {}
     }
 
-    const responseStream = await api.sendChatMessage(finalMessageText, activeChatId, activeParentId, model);
+    const responseStream = await api.sendChatMessage(finalMessageText, activeChatId, activeParentId, model, fileIdsToAttach);
     const cmplId = 'chatcmpl-' + Math.random().toString(36).substring(2, 15);
     const created = Math.floor(Date.now() / 1000);
     
@@ -540,8 +575,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     } else {
       let fullResponseText = '';
       let lastMsgId = activeParentId;
+      let streamError = null;
 
       for await (const chunk of api.parseConnectStream(responseStream)) {
+        if (chunk.__streamError) {
+          streamError = chunk.message || "Unknown upstream stream error.";
+          break;
+        }
+
         if (chunk.message && chunk.message.role === 'assistant' && chunk.message.id) {
           lastMsgId = chunk.message.id;
         }
@@ -550,9 +591,24 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
 
+      if (streamError) {
+        return res.status(429).json({ error: { message: `Upstream API Error (Rate Limit / Busy): ${streamError}`, type: 'api_error', param: null, code: 'rate_limit_exceeded' } });
+      }
+
       if (lastMsgId) cachedParentId = lastMsgId;
       
       completionTokens = Math.max(1, Math.floor(fullResponseText.length / 4));
+
+      // 4. Aggressively strip markdown if JSON format is requested
+      if (response_format && (response_format.type === 'json_object' || response_format.type === 'json_schema')) {
+        fullResponseText = fullResponseText.trim();
+        if (fullResponseText.startsWith('```')) {
+          fullResponseText = fullResponseText.replace(/^```(?:json)?\s*/i, '');
+        }
+        if (fullResponseText.endsWith('```')) {
+          fullResponseText = fullResponseText.replace(/\s*```$/, '');
+        }
+      }
 
       // 2. Parse Tool Calls if output is JSON
       let parsedToolCalls = null;

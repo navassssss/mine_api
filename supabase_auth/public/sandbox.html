@@ -289,7 +289,14 @@
         </button>
 
         <div class="premium-card" style="padding: 2rem; flex: 1; display: flex; flex-direction: column;">
-          <div class="terminal-title" style="margin-bottom: 0.75rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem; font-weight: 700; color: #fff;">Response Console</div>
+          <div class="terminal-header" style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem;">
+            <div class="terminal-title" style="font-weight: 700; color: #fff; white-space: nowrap;">Response Console</div>
+            <div class="terminal-metrics" id="terminal-metrics" style="display: flex; flex-wrap: wrap; gap: 1rem; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--text-muted); opacity: 0; transition: opacity 0.3s ease;">
+              <span style="white-space: nowrap;">TTFB: <span id="metric-ttfb" style="color: var(--accent-primary);">-- ms</span></span>
+              <span style="white-space: nowrap;">Total: <span id="metric-total" style="color: var(--accent-secondary);">-- ms</span></span>
+              <span style="white-space: nowrap;">Speed: <span id="metric-speed" style="color: #10b981;">-- tok/s</span></span>
+            </div>
+          </div>
           <div class="sandbox-terminal" id="terminal-display" style="flex: 1;">Response stream output will display here in real-time...</div>
         </div>
       </div>
@@ -441,6 +448,21 @@
       const payload = buildPayload();
       const wantStream = payload.stream;
 
+      // Metrics UI setup
+      const metricsContainer = document.getElementById('terminal-metrics');
+      const elTtfb = document.getElementById('metric-ttfb');
+      const elTotal = document.getElementById('metric-total');
+      const elSpeed = document.getElementById('metric-speed');
+      
+      metricsContainer.style.opacity = '1';
+      elTtfb.textContent = '-- ms';
+      elTotal.textContent = '-- ms';
+      elSpeed.textContent = '-- tok/s';
+
+      const startTime = performance.now();
+      let firstByteTime = null;
+      let tokenCount = 0; // Approximate
+
       if (wantStream) {
         terminal.textContent = '> Establishing SSE stream connection...\n';
         try {
@@ -468,7 +490,19 @@
           while (true) {
             const { done, value } = await reader.read();
             if (done) {
-              terminal.textContent += '\n\n> [Stream Finished]';
+              const endTime = performance.now();
+              const totalTime = (endTime - startTime).toFixed(0);
+              elTotal.textContent = `${totalTime} ms`;
+              
+              if (firstByteTime) {
+                // Approximate speed (1 token ~ 4 characters of output)
+                const tokens = Math.max(1, Math.floor(tokenCount / 4));
+                const sec = (endTime - firstByteTime) / 1000;
+                const speed = sec > 0 ? (tokens / sec).toFixed(1) : 0;
+                elSpeed.textContent = `${speed} tok/s`;
+              }
+              
+              terminal.textContent += `\n\n> [Stream Finished in ${totalTime}ms]`;
               break;
             }
 
@@ -482,7 +516,18 @@
 
               const dataStr = trimmed.slice(5).trim();
               if (dataStr === '[DONE]') {
-                terminal.textContent += '\n\n> [Stream Finished]';
+                const endTime = performance.now();
+                const totalTime = (endTime - startTime).toFixed(0);
+                elTotal.textContent = `${totalTime} ms`;
+                
+                if (firstByteTime) {
+                  const tokens = Math.max(1, Math.floor(tokenCount / 4));
+                  const sec = (endTime - firstByteTime) / 1000;
+                  const speed = sec > 0 ? (tokens / sec).toFixed(1) : 0;
+                  elSpeed.textContent = `${speed} tok/s`;
+                }
+
+                terminal.textContent += `\n\n> [Stream Finished in ${totalTime}ms]`;
                 return;
               }
 
@@ -493,6 +538,12 @@
                   return;
                 }
                 if (parsed.delta) {
+                  if (!firstByteTime) {
+                    firstByteTime = performance.now();
+                    const ttfb = (firstByteTime - startTime).toFixed(0);
+                    elTtfb.textContent = `${ttfb} ms`;
+                  }
+                  tokenCount += parsed.delta.length;
                   terminal.textContent += parsed.delta;
                   terminal.scrollTop = terminal.scrollHeight;
                 }
@@ -517,13 +568,24 @@
             body: JSON.stringify(payload)
           });
 
+          firstByteTime = performance.now();
+          const ttfb = (firstByteTime - startTime).toFixed(0);
+          elTtfb.textContent = `${ttfb} ms`;
+
           if (!response.ok) {
             const errData = await response.json().catch(() => ({}));
             throw new Error(errData.error || `HTTP ${response.status} ${response.statusText}`);
           }
 
           const resJson = await response.json();
-          terminal.textContent = `> Response received:\n\n${resJson.response}`;
+          const endTime = performance.now();
+          const totalTime = (endTime - startTime).toFixed(0);
+          elTotal.textContent = `${totalTime} ms`;
+          
+          const tokens = Math.floor((resJson.response?.length || 0) / 4);
+          elSpeed.textContent = `${tokens} tok (total)`;
+          
+          terminal.textContent = `> Response received in ${totalTime}ms:\n\n${resJson.response}`;
         } catch (err) {
           terminal.textContent += `\n❌ Error: ${err.message}`;
         }
